@@ -1,69 +1,135 @@
-// slippage_model.cpp
+
 #include "core/models/slippage_model.h"
 #include "core/utils/portable_math.h"
-#include <algorithm>
-#include <cmath>
-#include <numeric>
 #include <chrono>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
 
 namespace kubera {
 namespace models {
 
-SlippageModel::SlippageModel(logging::Logger& logger, utils::MemoryPool<64, 1024>& memory_pool)
-    : memory_pool_(memory_pool), logger_(logger), cache_valid_(false), history_size_(0) {
+SlippageModel::SlippageModel(
+    logging::Logger& logger, 
+    utils::MemoryPool<64, 1024>& memory_pool,
+    SharedCacheManager& shared_cache
+) : memory_pool_(memory_pool), logger_(logger), 
+    shared_cache_(shared_cache),
+    cache_valid_(false), history_size_(0) {
     
     // Initialize coefficients with industry-standard values
     // [intercept, spread, relative_size, volatility, imbalance, depth_ratio, price_momentum, volume_momentum]
     coefficients_[0] = {0.001, 0.5, 0.05, 0.02, 0.01, 0.005, 0.001, 0.001}; // 25th percentile
-    coefficients_[1] = {0.002, 1.0, 0.1, 0.04, 0.02, 0.01, 0.002, 0.002}; // 50th percentile (median)
+    coefficients_[1] = {0.002, 1.0, 0.1, 0.04, 0.02, 0.01, 0.002, 0.002};   // 50th percentile (median)
     coefficients_[2] = {0.004, 1.5, 0.15, 0.06, 0.03, 0.015, 0.003, 0.003}; // 75th percentile
     
+    utils::PortableMath::initialize();
     logger_.info("Slippage model initialized with {} quantile levels", QUANTILE_LEVELS);
 }
 
-SlippageModel::SlippageResult SlippageModel::predictSlippage(
+// ✅ NEW: HFT optimized prediction method
+SlippageModel::SlippageResult SlippageModel::predict_slippage_hft(
     double quantity,
-    const orderbook::OrderBook& orderBook,
-    bool isBuy
-) const {
+    double mid_price,
+    double spread,
+    double volatility,
+    double imbalance,
+    const std::array<double, 5>& ask_quantities,
+    const std::array<double, 5>& bid_quantities,
+    bool is_buy) const {
+    
     try {
-        // Process any pending updates - remove since const method can't modify state
-        // process_new_trade_records();
+        // Use thread-local buffer (zero allocation)
+        thread_local static std::array<double, MAX_FEATURES> feature_buffer;
         
-        // Use cached features for performance - simplified for const method
-        auto features = extract_features_full(quantity, orderBook, isBuy);
+        // Calculate total depth from atomic data
+        double ask_depth = std::accumulate(ask_quantities.begin(), ask_quantities.end(), 0.0);
+        double bid_depth = std::accumulate(bid_quantities.begin(), bid_quantities.end(), 0.0);
+        double total_depth = ask_depth + bid_depth;
+        
+        // Extract features directly into buffer
+        extract_features_zero_alloc(feature_buffer, quantity, mid_price, spread, 
+                                  volatility, imbalance, total_depth, is_buy);
         
         // Calculate quantile predictions
         std::array<double, QUANTILE_LEVELS> predictions;
-        
-        for (size_t q = 0; q < QUANTILE_LEVELS; ++q) {
-            predictions[q] = 0.0;
-            for (size_t f = 0; f < std::min(features.size(), coefficients_[q].size()); ++f) {
-                predictions[q] += coefficients_[q][f] * features[f];
+        {
+            std::shared_lock lock(coefficients_mutex_);
+            for (size_t q = 0; q < QUANTILE_LEVELS; ++q) {
+                predictions[q] = 0.0;
+                for (size_t f = 0; f < MAX_FEATURES; ++f) {
+                    predictions[q] += coefficients_[q][f] * feature_buffer[f];
+                }
             }
         }
         
-        // Ensure minimum slippage (half spread)
-        double spread = orderBook.getSpread();
+        // Apply minimum slippage constraint
         double min_slippage = spread * 0.5;
-        
         for (auto& pred : predictions) {
             pred = std::max(pred, min_slippage);
         }
         
-        // Adjust for direction
-        if (!isBuy) {
+        if (!is_buy) {
             for (auto& pred : predictions) {
                 pred = -pred;
             }
         }
         
-        return {
-            predictions[1], // Median as expected
-            predictions[0], // 25th percentile as lower bound
-            predictions[2], // 75th percentile as upper bound
-            0.85 // Default prediction quality
-        };
+        return {predictions[1], predictions[0], predictions[2], 0.85};
+        
+    } catch (const std::exception& e) {
+        logger_.error("Failed to predict slippage (HFT): {}", e.what());
+        return {0.0, 0.0, 0.0, 0.0};
+    }
+}
+
+// ✅ NEW: Zero-allocation feature extraction
+void SlippageModel::extract_features_zero_alloc(
+    std::array<double, MAX_FEATURES>& features,
+    double quantity,
+    double mid_price,
+    double spread,
+    double volatility,
+    double imbalance,
+    double total_depth,
+    bool is_buy) const {
+    
+    features[0] = 1.0; // intercept
+    features[1] = spread / std::max(mid_price, 1.0); // normalized_spread
+    features[2] = quantity / std::max(total_depth, 1.0); // relative_size
+    features[3] = std::min(volatility, 1.0); // bounded_volatility
+    features[4] = is_buy ? imbalance : -imbalance; // directional_imbalance
+    features[5] = 0.5; // depth_ratio (placeholder)
+    features[6] = std::tanh(std::min(volatility, 1.0) * 10.0); // price_momentum
+    features[7] = std::tanh(imbalance * 5.0); // volume_momentum
+}
+
+// ✅ Keep original method for backwards compatibility
+SlippageModel::SlippageResult SlippageModel::predictSlippage(
+    double quantity,
+    const orderbook::OrderBook& orderBook,
+    bool isBuy) const {
+    
+    try {
+        auto snapshot = orderBook.getSnapshot();
+        
+        // Calculate depths from snapshot
+        double ask_depth = 0.0, bid_depth = 0.0;
+        for (const auto& level : snapshot.asks) ask_depth += level.quantity;
+        for (const auto& level : snapshot.bids) bid_depth += level.quantity;
+        
+        // Convert to HFT arrays
+        std::array<double, 5> ask_quantities{}, bid_quantities{};
+        for (size_t i = 0; i < 5 && i < snapshot.asks.size(); ++i) {
+            ask_quantities[i] = snapshot.asks[i].quantity;
+        }
+        for (size_t i = 0; i < 5 && i < snapshot.bids.size(); ++i) {
+            bid_quantities[i] = snapshot.bids[i].quantity;
+        }
+        
+        return predict_slippage_hft(quantity, snapshot.midPrice, snapshot.spread,
+                                  snapshot.volatility, snapshot.imbalance,
+                                  ask_quantities, bid_quantities, isBuy);
         
     } catch (const std::exception& e) {
         logger_.error("Failed to predict slippage: {}", e.what());
@@ -71,85 +137,181 @@ SlippageModel::SlippageResult SlippageModel::predictSlippage(
     }
 }
 
-std::vector<double> SlippageModel::extract_features_full(
+// ✅ Optimized feature extraction with shared cache
+double* SlippageModel::extract_features_full(
     double quantity,
     const orderbook::OrderBook& order_book,
-    bool is_buy
-) const {
-    double midPrice = order_book.getMidPrice();
-    double spread = order_book.getSpread();
-    double depth = order_book.getDepth(5);
-    double volatility = order_book.getVolatility();
-    double imbalance = order_book.getImbalance();
+    bool is_buy) const {
     
-    // Note: Can't update cache in const method
+    double* features = allocateFeatureArray();
+    if (!features) return nullptr;
     
-    return {
-        1.0, // Intercept
-        spread / std::max(midPrice, 1.0), // Normalized spread
-        quantity / std::max(depth, 1.0), // Relative size
-        volatility, // Market volatility
-        is_buy ? imbalance : -imbalance, // Directional imbalance
-        0.5, // Default depth ratio
-        std::tanh(volatility * 10.0), // Price momentum
-        std::tanh(imbalance * 5.0) // Volume momentum
-    };
+    auto current_time_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    uint64_t ob_version = order_book.getSequenceNumber();
+    auto cache_snapshot = shared_cache_.get_snapshot();
+    
+    if (cache_snapshot.is_valid(ob_version, current_time_ns)) {
+        // Use cached data
+        extract_features_from_cache(features, quantity, cache_snapshot.data, is_buy);
+    } else {
+        // Use direct calculation
+        auto snapshot = order_book.getSnapshot();
+        extract_features_from_snapshot(features, quantity, static_cast<const kubera::orderbook::OrderBookSnapshot&>(snapshot), is_buy);
+    }
+    
+    return features;
 }
 
-std::vector<double> SlippageModel::extractFeatures(double quantity, const orderbook::OrderBook& orderBook, bool isBuy) {
+void SlippageModel::extract_features_from_snapshot(
+    double* features,
+    double quantity,
+    const orderbook::OrderBookSnapshot& snapshot,
+    bool is_buy) const {
+    
+    if (!features) return;
+    
+    // Calculate depths from snapshot
+    double ask_depth = 0.0, bid_depth = 0.0;
+    for (const auto& level : snapshot.asks) {
+        ask_depth += level.quantity;
+    }
+    for (const auto& level : snapshot.bids) {
+        bid_depth += level.quantity;
+    }
+    double total_depth = ask_depth + bid_depth;
+    
+    // Extract features
+    features[0] = 1.0; // intercept
+    features[1] = snapshot.spread / std::max(snapshot.midPrice, 1.0); // normalized_spread
+    features[2] = quantity / std::max(total_depth, 1.0); // relative_size
+    features[3] = std::min(snapshot.volatility, 1.0); // bounded_volatility
+    features[4] = is_buy ? snapshot.imbalance : -snapshot.imbalance; // directional_imbalance
+    features[5] = ask_depth / std::max(bid_depth, 1.0); // depth_ratio
+    features[6] = std::tanh(std::min(snapshot.volatility, 1.0) * 10.0); // price_momentum
+    features[7] = std::tanh(snapshot.imbalance * 5.0); // volume_momentum
+}
+
+void SlippageModel::extract_features_from_cache(
+    double* features,
+    double quantity,
+    const SharedMarketCache* cache,
+    bool is_buy) const {
+    
+    features[0] = 1.0;
+    features[1] = cache->spread / std::max(cache->midPrice, 1.0);
+    features[2] = quantity / std::max(cache->totalDepth, 1.0);
+    features[3] = std::min(cache->volatility, 1.0);
+    features[4] = is_buy ? cache->imbalance : -cache->imbalance;
+    features[5] = cache->askDepth / std::max(cache->bidDepth, 1.0);
+    features[6] = std::tanh(std::min(cache->volatility, 1.0) * 10.0);
+    features[7] = std::tanh(cache->imbalance * 5.0);
+}
+
+
+// ✅ Backwards compatibility aliases
+double* SlippageModel::extractFeatures(double quantity, const orderbook::OrderBook& orderBook, bool isBuy) {
     return extract_features_full(quantity, orderBook, isBuy);
 }
 
-void SlippageModel::process_new_trade_records() {
-    TradeData record;
-    while (new_trade_records_.try_dequeue(record)) {
-        std::lock_guard<std::mutex> lock(history_mutex_);
-        historical_data_.push_back(record);
-        
-        if (historical_data_.size() > MAX_HISTORY) {
-            historical_data_.pop_front();
-        }
-        
-        history_size_.store(historical_data_.size(), std::memory_order_relaxed);
+// ✅ Thread-safe coefficient management
+void SlippageModel::setCoefficients(size_t quantile_index, const std::vector<double>& coefficients) {
+    if (quantile_index >= QUANTILE_LEVELS) {
+        logger_.warning("Invalid quantile index: {}", quantile_index);
+        return;
     }
     
-    // Trigger model recalibration if enough new data
-    if (history_size_.load() >= 50) {
-        calibrateModel();
+    std::unique_lock lock(coefficients_mutex_);
+    for (size_t i = 0; i < std::min(coefficients.size(), static_cast<size_t>(MAX_FEATURES)); ++i) {
+        coefficients_[quantile_index][i] = coefficients[i];
     }
+    
+    logger_.info("Coefficients updated for quantile {}", quantile_index);
 }
 
+std::vector<double> SlippageModel::getCoefficients(size_t quantile_index) const {
+    if (quantile_index >= QUANTILE_LEVELS) {
+        return {};
+    }
+    
+    std::shared_lock lock(coefficients_mutex_);
+    return std::vector<double>(coefficients_[quantile_index].begin(), coefficients_[quantile_index].end());
+}
+
+// ✅ Model training and calibration
 void SlippageModel::updateModel(
     double quantity,
     const orderbook::OrderBook& orderBook,
     bool isBuy,
-    double actualSlippage
-) {
+    double actualSlippage) {
+    
     try {
-        // Extract features for this trade
-        auto features_vec = extractFeatures(quantity, orderBook, isBuy);
-        
+        auto snapshot = orderBook.getSnapshot();
         TradeData data;
-        // Convert vector to fixed-size array
-        for (size_t i = 0; i < std::min(features_vec.size(), data.features.size()); ++i) {
-            data.features[i] = features_vec[i];
+        
+        // Extract features from snapshot
+        double ask_depth = 0.0, bid_depth = 0.0;
+        for (const auto& level : snapshot.asks) ask_depth += level.quantity;
+        for (const auto& level : snapshot.bids) bid_depth += level.quantity;
+        double total_depth = ask_depth + bid_depth;
+        
+        std::array<double, MAX_FEATURES> features_array;
+        extract_features_zero_alloc(features_array, quantity, snapshot.midPrice, 
+                                   snapshot.spread, snapshot.volatility, 
+                                   snapshot.imbalance, total_depth, isBuy);
+        
+        // Copy to TradeData
+        for (size_t i = 0; i < MAX_FEATURES; ++i) {
+            data.features[i] = features_array[i];
         }
+        
         data.actualSlippage = actualSlippage;
         data.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         
         new_trade_records_.enqueue(data);
+        logger_.debug("Model updated with new trade data");
         
-        logger_.debug("Model updated with new trade data, historical data size: {}", history_size_.load());
     } catch (const std::exception& e) {
         logger_.error("Failed to update slippage model: {}", e.what());
     }
 }
 
-void SlippageModel::calibrateModel() {
-    std::lock_guard<std::mutex> lock(history_mutex_);
+void SlippageModel::process_new_trade_records() {
+    TradeData record;
+    std::vector<TradeData> batch;
+    batch.reserve(100);
     
-    if (historical_data_.size() < 20) return;
+    // Batch process records
+    while (batch.size() < 100 && new_trade_records_.try_dequeue(record)) {
+        batch.push_back(record);
+    }
+    
+    if (!batch.empty()) {
+        std::lock_guard lock(history_mutex_);
+        for (const auto& data : batch) {
+            historical_data_.push_back(data);
+            if (historical_data_.size() > MAX_HISTORY) {
+                historical_data_.pop_front();
+            }
+        }
+        
+        history_size_.store(historical_data_.size(), std::memory_order_relaxed);
+        
+        // Trigger model recalibration if enough new data
+        if (history_size_.load() >= 50) {
+            calibrateModel();
+        }
+    }
+}
+
+void SlippageModel::calibrateModel() {
+    std::vector<TradeData> training_data;
+    
+    {
+        std::lock_guard lock(history_mutex_);
+        if (historical_data_.size() < 20) return;
+        training_data.assign(historical_data_.begin(), historical_data_.end());
+    }
     
     // Simple gradient descent for quantile regression
     const double learning_rate = 0.01;
@@ -161,121 +323,33 @@ void SlippageModel::calibrateModel() {
         for (int iter = 0; iter < iterations; ++iter) {
             std::array<double, MAX_FEATURES> gradients{};
             
-            for (const auto& record : historical_data_) {
-                // Calculate prediction
+            for (const auto& data : training_data) {
                 double prediction = 0.0;
                 for (size_t f = 0; f < MAX_FEATURES; ++f) {
-                    prediction += coefficients_[q][f] * record.features[f];
+                    prediction += coefficients_[q][f] * data.features[f];
                 }
                 
-                // Quantile loss gradient
-                double error = record.actualSlippage - prediction;
-                double loss_gradient = (error > 0) ? quantile_level : (quantile_level - 1.0);
+                double error = data.actualSlippage - prediction;
+                double quantile_loss_gradient = (error > 0) ? quantile_level : (quantile_level - 1.0);
                 
-                // Accumulate gradients
                 for (size_t f = 0; f < MAX_FEATURES; ++f) {
-                    gradients[f] += loss_gradient * record.features[f];
+                    gradients[f] += quantile_loss_gradient * data.features[f];
                 }
             }
             
-            // Apply gradients
-            double inv_size = 1.0 / static_cast<double>(historical_data_.size());
+            // Update coefficients
+            std::unique_lock lock(coefficients_mutex_);
             for (size_t f = 0; f < MAX_FEATURES; ++f) {
-                gradients[f] *= inv_size;
-                coefficients_[q][f] -= learning_rate * gradients[f];
+                coefficients_[q][f] += learning_rate * gradients[f] / training_data.size();
             }
         }
     }
     
-    logger_.info("Slippage model recalibrated with {} samples", historical_data_.size());
+    logger_.info("Model calibrated with {} samples", training_data.size());
 }
 
-void SlippageModel::setCoefficients(const std::array<std::array<double, MAX_FEATURES>, QUANTILE_LEVELS>& coefficients) {
-    coefficients_ = coefficients;
-    logger_.info("Slippage model coefficients updated");
-}
-
-std::array<std::array<double, SlippageModel::MAX_FEATURES>, SlippageModel::QUANTILE_LEVELS> SlippageModel::getCoefficients() const {
-    return coefficients_;
-}
-
-SlippageModel::SlippageResult SlippageModel::predict_slippage_hft(
-    double quantity,
-    double mid_price,
-    double spread,
-    double volatility,
-    double imbalance,
-    const std::array<double, 5>& ask_quantities,
-    const std::array<double, 5>& bid_quantities,
-    bool is_buy
-) {
-    try {
-        // Calculate total depth from atomic data
-        double total_depth = 0.0;
-        const auto& quantities = is_buy ? ask_quantities : bid_quantities;
-        for (size_t i = 0; i < quantities.size(); ++i) {
-            total_depth += quantities[i];
-        }
-        
-        // Use stack-allocated feature array (zero allocation)
-        std::array<double, MAX_FEATURES> features;
-        extract_features_atomic(features, quantity, mid_price, spread,
-                              volatility, imbalance, total_depth, is_buy);
-        
-        // Calculate quantile predictions
-        std::array<double, QUANTILE_LEVELS> predictions;
-        
-        for (size_t q = 0; q < QUANTILE_LEVELS; ++q) {
-            predictions[q] = 0.0;
-            for (size_t f = 0; f < MAX_FEATURES; ++f) {
-                predictions[q] += coefficients_[q][f] * features[f];
-            }
-        }
-        
-        // Ensure minimum slippage (half spread)
-        double min_slippage = spread * 0.5;
-        for (auto& pred : predictions) {
-            pred = std::max(pred, min_slippage);
-        }
-        
-        // Adjust for direction
-        if (!is_buy) {
-            for (auto& pred : predictions) {
-                pred = -pred;
-            }
-        }
-        
-        return {
-            predictions[1], // Median as expected
-            predictions[0], // 25th percentile as lower bound
-            predictions[2], // 75th percentile as upper bound
-            0.85 // Default prediction quality
-        };
-        
-    } catch (const std::exception& e) {
-        logger_.error("Failed to predict slippage from atomics: {}", e.what());
-        return {0.0, 0.0, 0.0, 0.0};
-    }
-}
-
-void SlippageModel::extract_features_atomic(
-    std::array<double, MAX_FEATURES>& features,
-    double quantity,
-    double mid_price,
-    double spread,
-    double volatility,
-    double imbalance,
-    double total_depth,
-    bool is_buy
-) {
-    features[0] = 1.0; // Intercept
-    features[1] = spread / std::max(mid_price, 1.0); // Normalized spread
-    features[2] = quantity / std::max(total_depth, 1.0); // Relative size
-    features[3] = volatility;
-    features[4] = is_buy ? imbalance : -imbalance; // Directional imbalance
-    features[5] = 0.5; // Default depth ratio
-    features[6] = std::tanh(volatility * 10.0); // Price momentum
-    features[7] = std::tanh(imbalance * 5.0); // Volume momentum
+void SlippageModel::triggerBackgroundProcessing() {
+    process_new_trade_records();
 }
 
 } // namespace models

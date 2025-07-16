@@ -1,6 +1,6 @@
-// fee_calculator.cpp
 #include "core/models/fee_calculator.h"
 #include <algorithm>
+#include <cmath>
 
 namespace kubera {
 namespace models {
@@ -8,6 +8,7 @@ namespace models {
 FeeCalculator::FeeCalculator(logging::Logger& logger) : logger_(logger) {
     initialize_fee_tiers();
     initialize_lookup_table();
+    initialize_fast_lookup();
     logger_.info("Fee calculator initialized with {} tiers", feeTiers_.size());
 }
 
@@ -45,24 +46,58 @@ void FeeCalculator::initialize_lookup_table() {
     }
 }
 
-void FeeCalculator::update_lookup_table_for_tier(int tier) {
-    if (feeTiers_.find(tier) == feeTiers_.end() || tier > static_cast<int>(TIER_COUNT)) {
-        return;
-    }
-    
-    size_t tier_index = static_cast<size_t>(tier - 1);
-    const auto& tier_info = feeTiers_.at(tier);
-    
-    for (size_t prop = 0; prop < PROPORTION_STEPS; ++prop) {
-        double maker_proportion = static_cast<double>(prop) / 100.0;
-        double taker_proportion = 1.0 - maker_proportion;
-        
-        fee_lookup_table_[tier_index][prop] = 
-            tier_info.makerFee * maker_proportion + 
-            tier_info.takerFee * taker_proportion;
+// ✅ NEW: Initialize fast lookup for common proportions
+void FeeCalculator::initialize_fast_lookup() {
+    // Pre-compute for common maker proportions (0%, 25%, 50%, 75%, 100%)
+    for (size_t tier = 0; tier < TIER_COUNT; ++tier) {
+        for (size_t prop_idx = 0; prop_idx < FAST_LOOKUP_SIZE; ++prop_idx) {
+            double maker_proportion = static_cast<double>(prop_idx) / (FAST_LOOKUP_SIZE - 1);
+            size_t lookup_idx = static_cast<size_t>(maker_proportion * 100.0);
+            lookup_idx = std::min(lookup_idx, PROPORTION_STEPS - 1);
+            
+            fast_lookup_table_[tier][prop_idx] = fee_lookup_table_[tier][lookup_idx];
+        }
     }
 }
 
+// ✅ OPTIMIZED: Inline critical calculations
+double FeeCalculator::calculateFeesOptimized(
+    double quantity, 
+    double price, 
+    int fee_tier, 
+    double maker_proportion) const {
+    
+    // Fast path for common cases
+    if (fee_tier > 0 && fee_tier <= static_cast<int>(TIER_COUNT) && 
+        maker_proportion >= 0.0 && maker_proportion <= 1.0) {
+        
+        size_t tier_index = static_cast<size_t>(fee_tier - 1);
+        
+        // Check if it's a common proportion for fast lookup
+        if (maker_proportion == 0.0) {
+            return quantity * price * fast_lookup_table_[tier_index][0];
+        } else if (maker_proportion == 0.25) {
+            return quantity * price * fast_lookup_table_[tier_index][1];
+        } else if (maker_proportion == 0.5) {
+            return quantity * price * fast_lookup_table_[tier_index][2];
+        } else if (maker_proportion == 0.75) {
+            return quantity * price * fast_lookup_table_[tier_index][3];
+        } else if (maker_proportion == 1.0) {
+            return quantity * price * fast_lookup_table_[tier_index][4];
+        }
+        
+        // Use regular lookup table for other proportions
+        size_t prop_index = static_cast<size_t>(maker_proportion * 100.0);
+        prop_index = std::min(prop_index, PROPORTION_STEPS - 1);
+        
+        return quantity * price * fee_lookup_table_[tier_index][prop_index];
+    }
+    
+    // Fallback to full calculation
+    return calculateFees(quantity, price, fee_tier, maker_proportion);
+}
+
+// ✅ Keep original method for backwards compatibility
 double FeeCalculator::calculateFees(double quantity, double price, int feeTier, double makerProportion) const {
     try {
         // Ensure tier is valid
@@ -86,7 +121,6 @@ double FeeCalculator::calculateFees(double quantity, double price, int feeTier, 
             
             logger_.debug("Fees calculated using lookup table: total={} for quantity={}, price={}, tier={}, makerProportion={}",
                          total_fees, quantity, price, feeTier, makerProportion);
-            
             return total_fees;
         }
         
@@ -99,7 +133,6 @@ double FeeCalculator::calculateFees(double quantity, double price, int feeTier, 
         
         logger_.debug("Fees calculated: maker={}, taker={}, total={} for quantity={}, price={}, tier={}, makerProportion={}",
                      makerFee, takerFee, totalFees, quantity, price, feeTier, makerProportion);
-        
         return totalFees;
         
     } catch (const std::exception& e) {
@@ -108,12 +141,44 @@ double FeeCalculator::calculateFees(double quantity, double price, int feeTier, 
     }
 }
 
+// ✅ NEW: Batch fee calculation for multiple scenarios
+void FeeCalculator::calculateFeesBatch(
+    const std::vector<FeeRequest>& requests,
+    std::vector<double>& results) const {
+    
+    results.resize(requests.size());
+    
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
+        results[i] = calculateFeesOptimized(req.quantity, req.price, req.fee_tier, req.maker_proportion);
+    }
+}
+
+// Rest of the methods remain the same for backwards compatibility...
+void FeeCalculator::update_lookup_table_for_tier(int tier) {
+    if (feeTiers_.find(tier) == feeTiers_.end() || tier > static_cast<int>(TIER_COUNT)) {
+        return;
+    }
+    
+    size_t tier_index = static_cast<size_t>(tier - 1);
+    const auto& tier_info = feeTiers_.at(tier);
+    
+    for (size_t prop = 0; prop < PROPORTION_STEPS; ++prop) {
+        double maker_proportion = static_cast<double>(prop) / 100.0;
+        double taker_proportion = 1.0 - maker_proportion;
+        
+        fee_lookup_table_[tier_index][prop] = 
+            tier_info.makerFee * maker_proportion + 
+            tier_info.takerFee * taker_proportion;
+    }
+}
+
 FeeCalculator::FeeBreakdown FeeCalculator::calculate_fees_detailed(
     double quantity,
     double price,
     int fee_tier,
-    double maker_proportion
-) {
+    double maker_proportion) {
+    
     // Validate inputs
     if (feeTiers_.find(fee_tier) == feeTiers_.end()) {
         logger_.warning("Invalid fee tier: {}, using tier 1", fee_tier);
@@ -121,7 +186,6 @@ FeeCalculator::FeeBreakdown FeeCalculator::calculate_fees_detailed(
     }
     
     maker_proportion = std::max(0.0, std::min(1.0, maker_proportion));
-    
     double total_value = quantity * price;
     const auto& tier_info = feeTiers_.at(fee_tier);
     
@@ -151,7 +215,7 @@ void FeeCalculator::setFeeTier(int tier, double makerFee, double takerFee) {
     try {
         // Ensure fees are reasonable (allow negative for rebates)
         makerFee = std::max(-0.001, std::min(0.01, makerFee)); // -0.1% to 1%
-        takerFee = std::max(0.0, std::min(0.01, takerFee));    // 0% to 1%
+        takerFee = std::max(0.0, std::min(0.01, takerFee)); // 0% to 1%
         
         // Update fee tier
         feeTiers_[tier] = {makerFee, takerFee};
@@ -194,8 +258,8 @@ FeeCalculator::FeeOptimization FeeCalculator::suggest_optimization(
     double price,
     int current_tier,
     double current_maker_proportion,
-    double monthly_volume
-) {
+    double monthly_volume) {
+    
     // Current fees
     auto current_fees = calculate_fees_detailed(quantity, price, current_tier, current_maker_proportion);
     
@@ -206,7 +270,6 @@ FeeCalculator::FeeOptimization FeeCalculator::suggest_optimization(
     for (int prop = 0; prop <= 100; prop += 5) {
         double test_prop = static_cast<double>(prop) / 100.0;
         auto test_fees = calculate_fees_detailed(quantity, price, current_tier, test_prop);
-        
         if (test_fees.total_fees < lowest_fees) {
             lowest_fees = test_fees.total_fees;
             best_maker_prop = test_prop;
@@ -229,7 +292,6 @@ FeeCalculator::FeeOptimization FeeCalculator::suggest_optimization(
 
 FeeCalculator::FeeStatistics FeeCalculator::get_fee_statistics(double monthly_volume) {
     int best_tier = determine_fee_tier(monthly_volume);
-    
     if (best_tier > static_cast<int>(TIER_COUNT) || feeTiers_.find(best_tier) == feeTiers_.end()) {
         best_tier = 1;
     }

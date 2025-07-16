@@ -72,10 +72,13 @@ int main(int argc, char* argv[]) {
             });
         }
         
-        // Initialize models with correct memory pool type
-        kubera::models::SlippageModel slippageModel(logger, featurePool);
-        kubera::models::MarketImpactModel marketImpactModel(logger, messagePool);
-        kubera::models::MakerTakerModel makerTakerModel(logger, featurePool);
+        // Create shared cache manager
+        kubera::models::SharedCacheManager sharedCacheManager;
+
+        // Initialize models with correct memory pool type and shared cache
+        kubera::models::SlippageModel slippageModel(logger, featurePool, sharedCacheManager);
+        kubera::models::MarketImpactModel marketImpactModel(logger, messagePool, sharedCacheManager);
+        kubera::models::MakerTakerModel makerTakerModel(logger, featurePool, sharedCacheManager);
         kubera::models::FeeCalculator feeCalculator(logger);
 
         // CRITICAL: Create SHARED OrderBook instance

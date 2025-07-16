@@ -25,6 +25,32 @@ struct PriceLevel {
     PriceLevel(double p, double q) : price(p), quantity(q) {}
 };
 
+struct OrderBookSnapshot {
+    std::vector<PriceLevel> asks;
+    std::vector<PriceLevel> bids;
+    double midPrice;
+    double spread;
+    double imbalance;
+    double volatility;
+    uint64_t sequenceNumber;
+    std::string timestamp;
+    std::string exchange;
+    std::string symbol;
+    
+    OrderBookSnapshot() : midPrice(0.0), spread(0.0), imbalance(0.0), 
+                         volatility(0.0), sequenceNumber(0) {}
+};
+
+struct CachePriceLevel {
+    double price;
+    double quantity;
+    std::atomic<uint32_t> updateCount;
+    
+    CachePriceLevel() : price(0.0), quantity(0.0), updateCount(0) {}
+};
+
+// Forward declarations
+class PriceLevelPool;
 /**
  * @brief Order book update structure - MOVED TO NAMESPACE LEVEL for WebSocket compatibility
  */
@@ -75,20 +101,8 @@ public:
     /**
      * @brief Atomic snapshot for consistent reads
      */
-    struct OrderBookSnapshot {
-        std::vector<PriceLevel> asks;
-        std::vector<PriceLevel> bids;
-        double midPrice;
-        double spread;
-        double imbalance;
-        double volatility;
-        uint64_t sequenceNumber;
-        std::string timestamp;
-        std::string exchange;
-        std::string symbol;
-    };
-    
-    OrderBookSnapshot getSnapshot() const;
+    // Use global kubera::orderbook::OrderBookSnapshot
+    kubera::orderbook::OrderBookSnapshot getSnapshot() const;
 
 private:
     // Price indexing configuration

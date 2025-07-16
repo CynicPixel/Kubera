@@ -163,9 +163,9 @@ std::vector<PriceLevel> OrderBook::getBids() const {
     return getBidsAtomic();
 }
 
-OrderBook::OrderBookSnapshot OrderBook::getSnapshot() const {
+kubera::orderbook::OrderBookSnapshot OrderBook::getSnapshot() const {
     // Lock-free snapshot using atomic operations
-    OrderBookSnapshot snapshot;
+    kubera::orderbook::OrderBookSnapshot snapshot;
     snapshot.asks = getAsksAtomic();
     snapshot.bids = getBidsAtomic();
     snapshot.midPrice = cachedMidPrice_.load(std::memory_order_acquire);
@@ -176,7 +176,6 @@ OrderBook::OrderBookSnapshot OrderBook::getSnapshot() const {
     snapshot.timestamp = std::to_string(std::time(nullptr));
     snapshot.exchange = "OKX";
     snapshot.symbol = "BTC-USDT-SWAP";
-    
     return snapshot;
 }
 

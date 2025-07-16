@@ -1,0 +1,24 @@
+{
+  "name": "kubera",
+  "version": "0.1.0",
+  "description": "High-performance trade simulator leveraging real-time market data to estimate transaction costs and market impact",
+  "homepage": "https://github.com/yourusername/kubera",
+  "license": "MIT",
+  "dependencies": [
+    "boost-system",
+    "boost-thread",
+    "boost-beast",
+    "boost-asio",
+    "openssl",
+    "spdlog",
+    "fmt",
+    "simdjson",
+    "eigen3",
+    "glfw3",
+    {
+      "name": "imgui",
+      "features": ["glfw-binding", "opengl3-binding", "docking-experimental"]
+    }
+  ],
+  "builtin-baseline": "d43918b9143e24ffb56917daacd9126ad03014d6"
+}

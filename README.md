@@ -1,12 +1,12 @@
 # Kubera HFT Trade Simulator
 
-A high-performance, real-time High-Frequency Trading (HFT) simulator achieving **sub-100μs end-to-end latency** through advanced lock-free architecture and atomic operations.
+A high-performance, real-time High-Frequency Trading (HFT) simulator achieving low latency through advanced websocket coniguration, lock-free architecture and atomic operations.
 
 ## 🚀 Current Performance
 
 **Live Production Metrics** (4binance branch):
-- **WebSocket Processing**: 58.2μs avg (P99: 101μs) - *75% improvement from Phase 1 optimizations*
-- **Model Calculations**: 5.6μs avg (P99: 19.3μs) - *Atomic operations, zero-copy*
+- **WebSocket Processing**: 58.2μs avg (P99: 101μs)
+- **Model Calculations**: 5.6μs avg (P99: 19.3μs) - *Atomic operations, zero-copy, caching*
 - **UI Updates**: 202.4μs avg (P99: 425μs) - *Non-blocking render pipeline*
 - **Total End-to-End**: ~266μs (*Sub-millisecond HFT-grade performance*)
 
@@ -205,32 +205,10 @@ Kubera/
 └── build/                       # Optimized binary output
 ```
 
-## � Development Context
-
-### **Memory Bank Status**
-The `memory-bank/` directory contains detailed optimization analysis:
-- **phase1-optimization-results.md**: Documents the 75% WebSocket latency reduction
-- **current-architecture-analysis.md**: Technical details of lock-free implementation  
-- **optimization-plan.md**: Detailed Phase 2/3 roadmap with code examples
-
-### **Git Workflow**
-- **4binance branch**: Active development with all Phase 1 optimizations
-- **main branch**: Stable baseline for performance comparisons
-- **Performance regression testing**: Automated benchmarks on each commit
-
-## ⚡ Key Technical Achievements
-
-1. **Eliminated Shared Mutex Contention**: 75% latency reduction through atomic operations
-2. **Price-Indexed O(1) Access**: 10,000-level arrays with instant price discovery
-3. **Memory-Ordered Atomic Operations**: Acquire/release semantics for consistency
-4. **Cache-Aligned Data Structures**: 64-byte alignment for optimal CPU utilization
-5. **Zero-Copy Buffer Management**: Pre-allocated pools eliminating allocations
-6. **Research-Grade Financial Models**: Academically calibrated parameters
 
 ---
 
-**Production Notice**: This system achieves true HFT-grade performance with sub-100μs end-to-end latency. The Phase 1 atomic optimizations represent a **major performance breakthrough** in the lock-free architecture implementation.
-
+**Production Notice**: This system achieves true HFT-grade performance with sub-100μs end-to-end latency.
 ## 📋 Dependency Management
 
 This project uses vcpkg in manifest mode for dependency management. All dependencies are specified in the `vcpkg.json` file and will be automatically installed when building the project.

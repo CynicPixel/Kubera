@@ -222,7 +222,7 @@ void UserInterface::updateModels(
     
     try {
         // Get input parameters
-        double quantity = inputParams_.quantity;
+        double quantityUSD = inputParams_.quantity;  // USD amount from UI
         double volatility = inputParams_.volatility;
         int feeTier = inputParams_.feeTier;
         
@@ -238,32 +238,47 @@ void UserInterface::updateModels(
             logger_.debug("Using dummy order book for model calculations");
         }
         
-        // Calculate expected slippage
-        auto slippageResult = slippageModel.predictSlippage(quantity, *orderBook, true);
-        outputParams_.expectedSlippage = slippageResult.expected;  // Extract the double value
-        // Calculate expected market impact
-        auto impactComponents = marketImpactModel.calculateImpact(quantity, *orderBook, true);
-        outputParams_.expectedMarketImpact = impactComponents.total;
-        
-        // Calculate maker/taker proportion
-        outputParams_.makerTakerProportion = makerTakerModel.predictMakerProportion(quantity, *orderBook, true);
-        
-        // Calculate expected fees
+        // Get current price for unit conversion
         double price = orderBook->getMidPrice();
         if (price <= 0.0) {
-            price = 50000.0; // Default BTC price if no order book data
+            price = 119000.0; // Default BTC price if no order book data
         }
-        outputParams_.expectedFees = feeCalculator.calculateFees(quantity, price, feeTier, outputParams_.makerTakerProportion);
+        
+        // CRITICAL FIX: Convert USD quantity to number of contracts
+        double quantityContracts = quantityUSD / price;
+        
+        logger_.debug("Unit conversion: {} USD at price {} = {} contracts", 
+                     quantityUSD, price, quantityContracts);
+        
+        // Calculate expected slippage (using contracts, not USD)
+        auto slippageResult = slippageModel.predictSlippage(quantityContracts, *orderBook, true);
+        outputParams_.expectedSlippage = slippageResult.expected;
+        
+        // Calculate expected market impact (using contracts, not USD)
+        auto impactComponents = marketImpactModel.calculateImpact(quantityContracts, *orderBook, true);
+        outputParams_.expectedMarketImpact = impactComponents.total;
+        
+        // Calculate maker/taker proportion (using contracts, not USD)
+        outputParams_.makerTakerProportion = makerTakerModel.predictMakerProportion(quantityContracts, *orderBook, true);
+        
+        // Calculate expected fees (using contracts, not USD)
+        outputParams_.expectedFees = feeCalculator.calculateFees(quantityContracts, price, feeTier, outputParams_.makerTakerProportion);
         
         // Calculate net cost
         outputParams_.netCost = calculateNetCost();
         
         // Update last update time
         lastUpdateTime_ = std::chrono::steady_clock::now();
+        
+        logger_.debug("Model results: slippage={:.6f}, impact={:.6f}, fees={:.6f}, net_cost={:.6f}",
+                     outputParams_.expectedSlippage, outputParams_.expectedMarketImpact, 
+                     outputParams_.expectedFees, outputParams_.netCost);
+                     
     } catch (const std::exception& e) {
         logger_.error("Failed to update models: {}", e.what());
     }
 }
+
 
 void UserInterface::render() {
     // Start the Dear ImGui frame
@@ -349,7 +364,7 @@ void UserInterface::renderInputPanel() {
     // Quantity input
     float quantity = static_cast<float>(inputParams_.quantity);
     ImGui::Text("Quantity (USD):");
-    if (ImGui::SliderFloat("##Quantity", &quantity, 1.0f, 1000.0f, "%.1f")) {
+    if (ImGui::SliderFloat("##Quantity", &quantity, 1.0f, 100000.0f, "%.1f")) {
         inputParams_.quantity = static_cast<double>(quantity);
     }
     

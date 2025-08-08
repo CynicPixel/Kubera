@@ -111,7 +111,7 @@ bool ConfigurationManager::saveConfig() {
 
 void ConfigurationManager::initDefaults() {
     // WebSocket settings
-    defaults_["websocket.endpoint"] = std::string("wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP");
+    defaults_["websocket.endpoint"] = std::string("wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms");
     defaults_["websocket.reconnect_attempts"] = 10;
     defaults_["websocket.reconnect_delay_ms"] = 1000;
     

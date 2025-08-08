@@ -17,12 +17,11 @@ SlippageModel::SlippageModel(
     shared_cache_(shared_cache),
     cache_valid_(false), history_size_(0) {
     
-    // Initialize coefficients with industry-standard values
-    // [intercept, spread, relative_size, volatility, imbalance, depth_ratio, price_momentum, volume_momentum]
-    coefficients_[0] = {0.001, 0.5, 0.05, 0.02, 0.01, 0.005, 0.001, 0.001}; // 25th percentile
-    coefficients_[1] = {0.002, 1.0, 0.1, 0.04, 0.02, 0.01, 0.002, 0.002};   // 50th percentile (median)
-    coefficients_[2] = {0.004, 1.5, 0.15, 0.06, 0.03, 0.015, 0.003, 0.003}; // 75th percentile
-    
+// Research-based coefficients for cryptocurrency markets
+// [intercept, spread, relative_size, volatility, imbalance, depth_ratio, price_momentum, volume_momentum]
+coefficients_[0] = {0.05, 0.5, 2.5, 1.0, 0.5, 0.25, 0.05, 0.05};  // 25th percentile
+coefficients_[1] = {0.10, 1.0, 5.0, 2.0, 1.0, 0.5, 0.10, 0.10};   // 50th percentile (median)
+coefficients_[2] = {0.20, 1.5, 7.5, 3.0, 1.5, 0.75, 0.20, 0.20};  // 75th percentile
     utils::PortableMath::initialize();
     logger_.info("Slippage model initialized with {} quantile levels", QUANTILE_LEVELS);
 }

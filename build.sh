@@ -28,4 +28,4 @@ cmake --build build --config Release
 
 # Print success message
 echo "Build completed successfully!"
-echo "You can run the application with: ./build/bin/kubera"
+echo "You can run the application with: ./build/kubera"

@@ -77,7 +77,16 @@ int main(int argc, char* argv[]) {
 
         // Initialize models with correct memory pool type and shared cache
         kubera::models::SlippageModel slippageModel(logger, featurePool, sharedCacheManager);
-        kubera::models::MarketImpactModel marketImpactModel(logger, messagePool, sharedCacheManager);
+
+        kubera::models::MarketImpactModel::ModelParameters impactParams;
+        impactParams.volatility = 0.025;                    // 2.5% daily volatility
+        impactParams.permanent_impact_factor = 0.314;       // Academic calibration
+        impactParams.temporary_impact_factor = 0.142;       // Academic calibration  
+        impactParams.liquidity_factor = 1.0;                // Baseline liquidity
+        impactParams.price_impact_decay = 0.6;              // Power-law decay rate
+
+        kubera::models::MarketImpactModel marketImpactModel(logger, messagePool, sharedCacheManager, impactParams);
+        //kubera::models::MarketImpactModel marketImpactModel(logger, messagePool, sharedCacheManager);
         kubera::models::MakerTakerModel makerTakerModel(logger, featurePool, sharedCacheManager);
         kubera::models::FeeCalculator feeCalculator(logger);
 
@@ -90,7 +99,7 @@ int main(int argc, char* argv[]) {
         
         // Initialize WebSocket client
         auto websocketClient = std::make_unique<kubera::websocket::WebSocketClient>(
-            "wss://ws.gomarket-cpp.goquant.io/ws/l2-orderbook/okx/BTC-USDT-SWAP", 
+            "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms", 
             logger, 
             1, 
             false // Real mode
@@ -164,9 +173,13 @@ int main(int argc, char* argv[]) {
                 // Get input parameters - use defaults in headless mode
                 auto inputParams = headlessMode ? defaultParams : ui.getInputParameters();
                 
+                double price = sharedOrderBook->getMidPrice();
+                    if (price <= 0.0) price = 119000.0;
+                    double quantityContracts = inputParams.quantity / price;
+
                 // Use HFT optimized calculations (sub-10μs)
                 modelManager.calculateModelsHFT(
-                    inputParams.quantity,
+                    quantityContracts,
                     true, // is_buy
                     inputParams.feeTier
                 );

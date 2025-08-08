@@ -1,13 +1,11 @@
 //websocketclient.cpp
 #include "core/websocket/websocket_client.h"
+
 #include <thread>
 #include <chrono>
 #include <regex>
-#include <optional>
-#include <charconv>
-#include <simdjson.h>
-#include <boost/beast/ssl.hpp>
-#include <boost/asio/ssl.hpp>
+#include <iomanip>
+#include <sstream>
 
 // Namespace aliases for Boost.Beast
 namespace beast = boost::beast;
@@ -20,205 +18,174 @@ using tcp = ip::tcp;
 namespace kubera {
 namespace websocket {
 
-
 WebSocketClient::WebSocketClient(const std::string& endpoint, logging::Logger& logger, int coreId, bool useMockMode)
-    : endpoint_(endpoint), logger_(logger), coreId_(coreId), useMockMode_(useMockMode) {
+    : endpoint_(endpoint), logger_(logger), coreId_(coreId) {
     
-    // Parse the WebSocket URL
-    parseUrl(endpoint_, host_, port_, target_, secure_);
-    
-    if (useMockMode_) {
-        logger_.info("WebSocket client initialized in MOCK MODE with endpoint: {}", endpoint_);
+    // Configure Binance defaults if no endpoint provided
+    if (endpoint_.empty()) {
+        configureBinanceDefaults();
     } else {
-        logger_.info("WebSocket client initialized with endpoint: {}", endpoint_);
-        logger_.info("Host: {}, Port: {}, Target: {}, Secure: {}", host_, port_, target_, secure_ ? "true" : "false");
+        parseUrl(endpoint_, host_, port_, target_, symbol_);
     }
+    
+    logger_.info("Binance WebSocket client initialized with endpoint: {}", endpoint_);
+    logger_.info("Host: {}, Port: {}, Target: {}, Symbol: {}", host_, port_, target_, symbol_);
 }
 
 WebSocketClient::~WebSocketClient() {
     disconnect();
 }
 
-void WebSocketClient::parseUrl(const std::string& url, std::string& host, std::string& port, 
-                              std::string& target, bool& secure) {
-    // Regular expression to parse WebSocket URL
-    // Format: (ws|wss)://hostname[:port][/path]
-    std::regex urlRegex(R"((ws|wss)://([^:/]+)(?::(\d+))?(/.*))");
+void WebSocketClient::configureBinanceDefaults() {
+    endpoint_ = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms";
+    host_ = "stream.binance.com";
+    port_ = "9443";
+    target_ = "/ws/btcusdt@depth20@100ms";
+    symbol_ = "BTC-USDT";
+    
+    logger_.info("Configured default Binance endpoint for BTC-USDT");
+}
+
+void WebSocketClient::parseUrl(const std::string& url, std::string& host, std::string& port,
+                              std::string& target, std::string& symbol) {
+    // Parse Binance WebSocket URL
+    // Format: wss://stream.binance.com:9443/ws/SYMBOL@depth20@100ms
+    std::regex urlRegex(R"(wss://([^:/]+)(?::(\d+))?(/ws/([^@]+)@.+))");
     std::smatch match;
     
     if (std::regex_match(url, match, urlRegex)) {
-        std::string scheme = match[1].str();
-        host = match[2].str();
-        port = match[3].length() > 0 ? match[3].str() : (scheme == "wss" ? "443" : "80");
-        target = match[4].str();
-        secure = (scheme == "wss");
+        host = match[1].str();
+        port = match[2].length() > 0 ? match[2].str() : "9443";
+        target = match[3].str();
+        
+        // Extract symbol and convert to standard format
+        std::string binanceSymbol = match[4].str();
+        if (binanceSymbol == "btcusdt") {
+            symbol = "BTC-USDT";
+        } else if (binanceSymbol == "ethusdt") {
+            symbol = "ETH-USDT";
+        } else if (binanceSymbol == "solusdt") {
+            symbol = "SOL-USDT";
+        } else {
+            symbol = binanceSymbol; // Use as-is for other symbols
+        }
     } else {
-        // Default values if URL parsing fails
-        host = "localhost";
-        port = "80";
-        target = "/";
-        secure = false;
-        logger_.warning("Failed to parse WebSocket URL: {}, using defaults", url);
+        logger_.warning("Failed to parse Binance WebSocket URL: {}, using defaults", url);
+        configureBinanceDefaults();
     }
+}
+
+std::string WebSocketClient::getCurrentTimestamp() const {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%S");
+    ss << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
+    return ss.str();
 }
 
 bool WebSocketClient::connect() {
     if (connecting_ || connected_) {
-        logger_.warning("Already connecting or connected to WebSocket endpoint: {}", endpoint_);
+        logger_.warning("Already connecting or connected to Binance WebSocket: {}", endpoint_);
         return connected_;
     }
-
+    
     connecting_ = true;
-
-    if (useMockMode_) {
-        // Mock mode logic
-        return true;
-    }
-
+    
     try {
-        ioc_ = std::make_unique<net::io_context>();
+        // Initialize Boost.ASIO components
+        ioc_ = std::make_unique<boost::asio::io_context>();
         resolver_ = std::make_unique<tcp::resolver>(*ioc_);
-
-        if (secure_) {
-            // Enhanced SSL context configuration
-            sslCtx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tlsv12_client);
-            
-            // Set proper SSL options
-            sslCtx_->set_default_verify_paths();
-            sslCtx_->set_verify_mode(boost::asio::ssl::verify_peer);
-            sslCtx_->set_verify_callback([this](bool preverified, boost::asio::ssl::verify_context& ctx) {
-                return true; // Accept all certificates
+        
+        // Enhanced SSL context configuration for Binance
+        sslCtx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tlsv12_client);
+        sslCtx_->set_default_verify_paths();
+        sslCtx_->set_verify_mode(boost::asio::ssl::verify_peer);
+        sslCtx_->set_verify_callback([this](bool preverified, boost::asio::ssl::verify_context& ctx) {
+            return true; // Accept Binance certificates
+        });
+        
+        // Create SSL WebSocket stream
+        ssl_ws_ = std::make_unique<beast_websocket::stream<beast::ssl_stream<tcp::socket>>>(*ioc_, *sslCtx_);
+        
+        // Set SNI hostname for Binance
+        SSL_set_tlsext_host_name(ssl_ws_->next_layer().native_handle(), host_.c_str());
+        
+        // Configure WebSocket options optimized for Binance
+        ssl_ws_->set_option(beast_websocket::stream_base::timeout::suggested(beast::role_type::client));
+        ssl_ws_->set_option(beast_websocket::stream_base::decorator([](beast_websocket::request_type& req) {
+            req.set(http::field::user_agent, "Kubera-Binance-HFT/1.0");
+        }));
+        
+        auto& stream = beast::get_lowest_layer(*ssl_ws_);
+        
+        logger_.info("Resolving Binance host: {}", host_);
+        auto results = resolver_->resolve(host_, port_);
+        logger_.info("Connecting to Binance endpoint: {}:{}", host_, port_);
+        boost::asio::connect(stream, results);
+        // Set TCP options for HFT performance
+        stream.set_option(tcp::no_delay(true));
+        
+        logger_.info("Performing SSL handshake with Binance");
+        ssl_ws_->next_layer().handshake(boost::asio::ssl::stream_base::client);
+        
+        logger_.info("Performing WebSocket handshake with target: {}", target_);
+        ssl_ws_->handshake(host_, target_);
+        
+        connected_ = ssl_ws_->is_open();
+        logger_.info("Binance SSL WebSocket is open: {}", connected_ ? "yes" : "no");
+        
+        if (connected_) {
+            // Start IO thread AFTER successful connection
+            workGuard_ = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(ioc_->get_executor());
+            ioThread_ = std::thread([this] {
+                try {
+                    logger_.info("Starting IO thread");
+                    ioc_->run();
+                    logger_.info("IO thread exited");
+                } catch (const std::exception& e) {
+                    logger_.error("Exception in IO thread: {}", e.what());
+                }
             });
             
-            // CREATE the SSL WebSocket FIRST
-            ssl_ws_ = std::make_unique<beast_websocket::stream<boost::asio::ssl::stream<beast::tcp_stream>>>(*ioc_, *sslCtx_);
+            connecting_ = false;
+            currentRetries_ = 0;
             
-            // THEN set SNI hostname
-            SSL_set_tlsext_host_name(ssl_ws_->next_layer().native_handle(), host_.c_str());
-            
-            // Configure WebSocket options
-            ssl_ws_->set_option(beast_websocket::stream_base::timeout::suggested(beast::role_type::client));
-            ssl_ws_->set_option(beast_websocket::stream_base::decorator([](beast_websocket::request_type& req) {
-                req.set(http::field::user_agent, "Kubera-WebSocket-Client/1.0");
-            }));
-
-            auto& stream = beast::get_lowest_layer(*ssl_ws_);
-            
-            logger_.info("Resolving host: {}", host_);
-            auto const results = resolver_->resolve(host_, port_);
-            
-            logger_.info("Connecting to endpoint: {}:{}", host_, port_);
-            stream.connect(results);
-            
-            // Set TCP options
-            stream.socket().set_option(tcp::no_delay(true));
-            
-            logger_.info("Performing SSL handshake");
-            ssl_ws_->next_layer().handshake(boost::asio::ssl::stream_base::client);
-            
-            logger_.info("Performing WebSocket handshake with target: {}", target_);
-            ssl_ws_->handshake(host_, target_);
-            
-            logger_.info("SSL WebSocket is open: {}", ssl_ws_->is_open() ? "yes" : "no");
-        } else {
-            // Non-SSL WebSocket logic (unchanged)
-            ws_ = std::make_unique<beast_websocket::stream<beast::tcp_stream>>(*ioc_);
-            auto& stream = beast::get_lowest_layer(*ws_);
-            
-            logger_.info("Resolving host: {}", host_);
-            auto const results = resolver_->resolve(host_, port_);
-            
-            logger_.info("Connecting to endpoint: {}:{}", host_, port_);
-            stream.connect(results);
-            stream.socket().set_option(tcp::no_delay(true));
-            
-            logger_.info("Performing WebSocket handshake with target: {}", target_);
-            ws_->handshake(host_, target_);
-            
-            logger_.info("WebSocket is open: {}", ws_->is_open() ? "yes" : "no");
-        }
-        
-        // Start IO thread AFTER successful connection
-        workGuard_ = std::make_unique<net::executor_work_guard<net::io_context::executor_type>>(ioc_->get_executor());
-        ioThread_ = std::thread([this] {
-            try {
-                logger_.info("Starting IO thread");
-                ioc_->run();
-                logger_.info("IO thread exited");
-            } catch (const std::exception& e) {
-                logger_.error("Exception in IO thread: {}", e.what());
-            }
-        });
-
-
-        connected_ = true;
-        connecting_ = false;
-        currentRetries_ = 0;
-       
-        
-        // Start appropriate read loop
-        if (secure_) {
+            // Start SSL read loop
             startSslReadLoop();
-        } else {
-            startReadLoop();
+            handleConnection();
+            
+            logger_.info("Connected to Binance WebSocket endpoint: {}", endpoint_);
+            return true;
         }
-        
-         handleConnection();
-        
-
-        logger_.info("Connected to WebSocket endpoint: {}", endpoint_);
-        return true;
         
     } catch (const std::exception& e) {
         std::string errorMsg = e.what();
-        logger_.error("Exception while connecting to WebSocket endpoint: {}", errorMsg);
+        logger_.error("Exception while connecting to Binance WebSocket: {}", errorMsg);
         
-        // Enhanced error diagnostics
+        // Enhanced error diagnostics for Binance
         if (errorMsg.find("handshake") != std::string::npos) {
-            logger_.error("WebSocket handshake failed. Possible causes:");
-            logger_.error("1. SSL/TLS version mismatch");
+            logger_.error("Binance WebSocket handshake failed. Possible causes:");
+            logger_.error("1. SSL/TLS version mismatch with Binance");
             logger_.error("2. Certificate verification failure");
-            logger_.error("3. Server rejected the WebSocket upgrade request");
-            logger_.error("4. Network connectivity issues");
+            logger_.error("3. Binance server rejected the WebSocket upgrade");
+            logger_.error("4. Network connectivity to Binance blocked");
         }
         
         cleanup();
         connecting_ = false;
         return false;
     }
-}
-
-
-bool WebSocketClient::sendTestMessage() {
-    if (useMockMode_) {
-        logger_.info("Mock mode enabled, simulating test message");
-        return true;
-    }
     
-    if (!isConnected()) {
-        logger_.error("Cannot send test message: not connected");
-        return false;
-    }
-    logger_.info("Connected to pre-configured gateway - no subscription message needed");
-    return true;
-   
+    connecting_ = false;
+    return false;
 }
 
 void WebSocketClient::disconnect() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    // Handle mock mode
-    if (useMockMode_) {
-        // Stop the mock thread
-        mockRunning_ = false;
-        if (mockThread_.joinable()) {
-            mockThread_.join();
-        }
-        connected_ = false;
-        connecting_ = false;
-        logger_.info("Disconnected from mock WebSocket endpoint");
-        return;
-    }
     
     if (connected_ || connecting_) {
         try {
@@ -226,27 +193,21 @@ void WebSocketClient::disconnect() {
             connected_ = false;
             connecting_ = false;
             
-            // Close the WebSocket connection
-            if (secure_ && ssl_ws_ && ssl_ws_->is_open()) {
+            // Close the SSL WebSocket connection
+            if (ssl_ws_ && ssl_ws_->is_open()) {
                 boost::system::error_code ec;
                 ssl_ws_->close(beast_websocket::close_code::normal, ec);
                 if (ec) {
-                    logger_.warning("Error during SSL WebSocket close: {}", ec.message());
-                }
-            } else if (!secure_ && ws_ && ws_->is_open()) {
-                boost::system::error_code ec;
-                ws_->close(beast_websocket::close_code::normal, ec);
-                if (ec) {
-                    logger_.warning("Error during WebSocket close: {}", ec.message());
+                    logger_.warning("Error during Binance SSL WebSocket close: {}", ec.message());
                 }
             }
             
             // Clean up resources
             cleanup();
+            logger_.info("Disconnected from Binance WebSocket endpoint: {}", endpoint_);
             
-            logger_.info("Disconnected from WebSocket endpoint: {}", endpoint_);
         } catch (const std::exception& e) {
-            logger_.error("Exception during disconnection: {}", e.what());
+            logger_.error("Exception during Binance disconnection: {}", e.what());
         }
     }
 }
@@ -264,10 +225,194 @@ void WebSocketClient::cleanup() {
     }
     
     // Reset Boost.Beast components
-    ssl_ws_.reset(); 
-    ws_.reset();
+    ssl_ws_.reset();
     resolver_.reset();
     ioc_.reset();
+}
+
+void WebSocketClient::startSslReadLoop() {
+    if (!connected_ || !ssl_ws_ || !ssl_ws_->is_open()) {
+        logger_.warning("Cannot start Binance SSL read loop: connection not ready");
+        return;
+    }
+    
+    // Create a flat buffer for Binance message reading
+    auto flatBuffer = std::make_shared<beast::flat_buffer>();
+    flatBuffer->reserve(BUFFER_INITIAL_SIZE);
+    
+    // Start asynchronous read optimized for Binance
+    auto self = this;
+    ssl_ws_->async_read(
+        *flatBuffer,
+        [self, flatBuffer](boost::system::error_code ec, std::size_t bytes_transferred) {
+            if (ec) {
+                if (ec == boost::beast::websocket::error::closed) {
+                    self->logger_.info("Binance WebSocket connection closed gracefully");
+                    self->handleDisconnection();
+                } else if (ec == boost::asio::error::operation_aborted) {
+                    self->logger_.info("Binance read operation was cancelled");
+                } else {
+                    self->logger_.error("Binance SSL read error: {} (code: {})", ec.message(), ec.value());
+                    self->handleError(ec.message());
+                }
+                return;
+            }
+            
+            self->logger_.debug("Binance SSL read callback: received {} bytes", bytes_transferred);
+            
+            try {
+                // Convert buffer to string
+                std::string message = boost::beast::buffers_to_string(flatBuffer->data());
+                
+                // Handle the Binance message
+                self->handleMessage(message);
+                
+                // Clear the buffer for next read
+                flatBuffer->consume(flatBuffer->size());
+                
+                // Continue reading if still connected
+                if (self->connected_ && self->ssl_ws_ && self->ssl_ws_->is_open()) {
+                    self->startSslReadLoop();
+                } else {
+                    self->logger_.warning("Stopping Binance SSL read loop: connection no longer active");
+                }
+                
+            } catch (const std::exception& e) {
+                self->logger_.error("Exception in Binance SSL read callback: {}", e.what());
+                self->handleError(e.what());
+            }
+        });
+}
+
+void WebSocketClient::handleMessage(const std::string& message) {
+    try {
+        logger_.debug("Received Binance message: {}", message.substr(0, 100)); // Show first 100 chars
+        
+        // Parse Binance message
+        auto update = parseBinanceMessage(message);
+        if (update) {
+            logger_.debug("Parsed Binance update: {} asks, {} bids", update->asks.size(), update->bids.size());
+            
+            // **CRITICAL**: Direct OrderBook update for HFT performance
+            if (orderBook_) {
+                orderBook_->update(*update);
+                logger_.debug("Updated OrderBook with {} asks, {} bids", update->asks.size(), update->bids.size());
+            }
+            
+            // Also enqueue for compatibility
+            if (!updateQueue_.enqueue(*update)) {
+                logger_.warning("Failed to enqueue Binance update - queue full");
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        logger_.error("Exception while handling Binance message: {}", e.what());
+    }
+}
+
+std::optional<kubera::orderbook::OrderBookUpdate> WebSocketClient::parseBinanceMessage(const std::string& message) {
+    try {
+        logger_.debug("Parsing Binance message: {}", message.substr(0, 200) + "...");
+        
+        // Parse JSON using simdjson
+        simdjson::dom::parser parser;
+        simdjson::dom::element json = parser.parse(message);
+        
+        // Create update object
+        kubera::orderbook::OrderBookUpdate update;
+        
+        // Generate missing fields that Binance doesn't provide
+        update.timestamp = getCurrentTimestamp();
+        update.exchange = "BINANCE";
+        update.symbol = symbol_;
+        
+        // Parse asks array
+        if (json["asks"].error() == simdjson::SUCCESS) {
+            auto asksArray = json["asks"].get_array().value();
+            update.asks.reserve(asksArray.size());
+            
+            for (auto askElement : asksArray) {
+                try {
+                    auto askArray = askElement.get_array().value();
+                    if (askArray.size() >= 2) {
+                        // Binance sends price and quantity as strings
+                        std::string_view priceStr = askArray.at(0).get_string().value();
+                        std::string_view quantityStr = askArray.at(1).get_string().value();
+                        
+                        double price = std::stod(std::string(priceStr));
+                        double quantity = std::stod(std::string(quantityStr));
+                        
+                        update.asks.emplace_back(price, quantity);
+                    } else {
+                        logger_.warning("Invalid Binance ask array format: expected 2 elements, got {}", askArray.size());
+                    }
+                } catch (const std::exception& e) {
+                    logger_.warning("Failed to parse Binance ask entry: {}", e.what());
+                    continue; // Skip this entry but continue processing
+                }
+            }
+            logger_.debug("Parsed {} Binance ask levels", update.asks.size());
+        } else {
+            logger_.warning("No 'asks' field found in Binance message");
+        }
+        
+        // Parse bids array
+        if (json["bids"].error() == simdjson::SUCCESS) {
+            auto bidsArray = json["bids"].get_array().value();
+            update.bids.reserve(bidsArray.size());
+            
+            for (auto bidElement : bidsArray) {
+                try {
+                    auto bidArray = bidElement.get_array().value();
+                    if (bidArray.size() >= 2) {
+                        // Binance sends price and quantity as strings
+                        std::string_view priceStr = bidArray.at(0).get_string().value();
+                        std::string_view quantityStr = bidArray.at(1).get_string().value();
+                        
+                        double price = std::stod(std::string(priceStr));
+                        double quantity = std::stod(std::string(quantityStr));
+                        
+                        update.bids.emplace_back(price, quantity);
+                    } else {
+                        logger_.warning("Invalid Binance bid array format: expected 2 elements, got {}", bidArray.size());
+                    }
+                } catch (const std::exception& e) {
+                    logger_.warning("Failed to parse Binance bid entry: {}", e.what());
+                    continue; // Skip this entry but continue processing
+                }
+            }
+            logger_.debug("Parsed {} Binance bid levels", update.bids.size());
+        } else {
+            logger_.warning("No 'bids' field found in Binance message");
+        }
+        
+        // Validate that we have meaningful data
+        if (update.asks.empty() && update.bids.empty()) {
+            logger_.warning("Parsed Binance message contains no orderbook data");
+            return std::nullopt;
+        }
+        
+        logger_.debug("Successfully parsed Binance orderbook update: {} asks, {} bids for {}",
+                     update.asks.size(), update.bids.size(), update.symbol);
+        return update;
+        
+    } catch (const simdjson::simdjson_error& e) {
+        logger_.error("simdjson parsing error for Binance message: {}", e.what());
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        logger_.error("Failed to parse Binance message: {}", e.what());
+        logger_.debug("Binance message content: {}", message);
+        return std::nullopt;
+    }
+}
+
+bool WebSocketClient::isConnected() const {
+    return connected_ && ssl_ws_ && ssl_ws_->is_open();
+}
+
+void WebSocketClient::setOrderBook(std::shared_ptr<orderbook::OrderBook> orderBook) {
+    orderBook_ = orderBook;
+    logger_.info("OrderBook linked to Binance WebSocket client for direct HFT updates");
 }
 
 std::optional<kubera::orderbook::OrderBookUpdate> WebSocketClient::getNextUpdate() {
@@ -278,153 +423,15 @@ std::optional<kubera::orderbook::OrderBookUpdate> WebSocketClient::getNextUpdate
     return std::nullopt;
 }
 
-bool WebSocketClient::isConnected() const {
-    if (useMockMode_) {
-        return connected_;
-    }
-    if (secure_) {
-        return connected_ && ssl_ws_ && ssl_ws_->is_open();
-    } else {
-        return connected_ && ws_ && ws_->is_open();
-    }
-}
-
-void WebSocketClient::setReconnectionOptions(
-    int maxRetries,
-    int initialDelayMs,
-    int maxDelayMs,
-    double backoffMultiplier
-) {
-    maxRetries_ = maxRetries;
-    initialDelayMs_ = initialDelayMs;
-    maxDelayMs_ = maxDelayMs;
-    backoffMultiplier_ = backoffMultiplier;
-    
-    logger_.info("Reconnection options set: maxRetries={}, initialDelayMs={}, maxDelayMs={}, backoffMultiplier={}",
-               maxRetries_, initialDelayMs_, maxDelayMs_, backoffMultiplier_);
-}
-
-void WebSocketClient::startReadLoop() {
-    if (!connected_ || !ws_ || !ws_->is_open()) {
-        return;
-    }
-    
-    // Create a flat buffer
-    auto flatBuffer = std::make_shared<beast::flat_buffer>();
-    
-    // Start asynchronous read
-    auto self = this; // Capture 'this' to ensure it remains valid
-    ws_->async_read(
-        *flatBuffer,
-        [self, flatBuffer](boost::system::error_code ec, std::size_t bytes_transferred) {
-            self->logger_.critical("READ CALLBACK ENTRY - bytes: {}", bytes_transferred);
-            if (ec) {
-                if (ec != beast_websocket::error::closed) {
-                    self->handleError(ec.message());
-                }
-                return;
-            }
-            
-            // Process the message
-            std::string message(
-                static_cast<char const*>(flatBuffer->data().data()),
-                flatBuffer->size());
-            
-            // Handle the message
-            self->handleMessage(message);
-            
-            // Clear the buffer
-            flatBuffer->consume(flatBuffer->size());
-            
-            // Continue reading if still connected
-            if (self->connected_ && self->ws_ && self->ws_->is_open()) {
-                self->startReadLoop();
-            }
-        });
-}
-
-void WebSocketClient::startSslReadLoop() {
-    if (!connected_ || !ssl_ws_ || !ssl_ws_->is_open()) {
-        logger_.warning("Cannot start SSL read loop: connection not ready");
-        return;
-    }
-    
-    // Create a flat buffer with appropriate size
-    auto flatBuffer = std::make_shared<boost::beast::flat_buffer>();
-    flatBuffer->reserve(BUFFER_INITIAL_SIZE);
-    
-    // Start asynchronous read with proper error handling
-    auto self = this;
-    ssl_ws_->async_read(
-        *flatBuffer,
-        [self, flatBuffer](boost::system::error_code ec, std::size_t bytes_transferred) {
-            if (ec) {
-                if (ec == boost::beast::websocket::error::closed) {
-                    self->logger_.info("WebSocket connection closed gracefully");
-                    self->handleDisconnection();
-                } else if (ec == boost::asio::error::operation_aborted) {
-                    self->logger_.info("Read operation was cancelled");
-                } else {
-                    self->logger_.error("SSL read error: {} (code: {})", ec.message(), ec.value());
-                    self->handleError(ec.message());
-                }
-                return;
-            }
-            
-            self->logger_.debug("SSL read callback: received {} bytes", bytes_transferred);
-            
-            try {
-                // Convert buffer to string
-                std::string message = boost::beast::buffers_to_string(flatBuffer->data());
-                
-                // Handle the message
-                self->handleMessage(message);
-                
-                // Clear the buffer for next read
-                flatBuffer->consume(flatBuffer->size());
-                
-                // Continue reading if still connected
-                if (self->connected_ && self->ssl_ws_ && self->ssl_ws_->is_open()) {
-                    self->startSslReadLoop();
-                } else {
-                    self->logger_.warning("Stopping SSL read loop: connection no longer active");
-                }
-            } catch (const std::exception& e) {
-                self->logger_.error("Exception in SSL read callback: {}", e.what());
-                self->handleError(e.what());
-            }
-        });
-}
-
-void WebSocketClient::handleMessage(const std::string& message) {
-    try {
-        logger_.debug("Received message: {}", message.substr(0, 100)); // Show first 100 chars
-        
-        // Parse message
-        auto update = parseMessage(message);
-        
-        if (update) {
-            logger_.debug("Parsed update: {} asks, {} bids", update->asks.size(), update->bids.size());
-            
-            // **CRITICAL FIX**: Update OrderBook directly for HFT performance
-            if (orderBook_) {
-                orderBook_->update(*update);
-                logger_.debug("Updated OrderBook with {} asks, {} bids", update->asks.size(), update->bids.size());
-            }
-            
-            // Also enqueue for compatibility
-            if (!updateQueue_.enqueue(*update)) {
-                logger_.warning("Failed to enqueue update");
-            }
-        }
-    } catch (const std::exception& e) {
-        logger_.error("Exception while handling message: {}", e.what());
-    }
+void WebSocketClient::processMessages() {
+    // This method is kept for API compatibility
+    // In optimized version, messages are processed asynchronously
+    // For now, just return - the read loop handles message processing
+    return;
 }
 
 void WebSocketClient::handleError(const std::string& error) {
-    logger_.error("WebSocket error: {}", error);
-    
+    logger_.error("Binance WebSocket error: {}", error);
     // Attempt to reconnect
     if (connected_) {
         connected_ = false;
@@ -433,29 +440,27 @@ void WebSocketClient::handleError(const std::string& error) {
 }
 
 void WebSocketClient::handleConnection() {
-    logger_.info("WebSocket connected");
+    logger_.info("Binance WebSocket connected");
     connected_ = true;
     currentRetries_ = 0;
 }
 
 void WebSocketClient::handleDisconnection() {
-    logger_.info("WebSocket disconnected");
+    logger_.info("Binance WebSocket disconnected");
     connected_ = false;
-    
     // Attempt to reconnect
     reconnect();
 }
 
 bool WebSocketClient::reconnect() {
     if (currentRetries_ >= maxRetries_) {
-        logger_.error("Maximum reconnection attempts reached");
+        logger_.error("Maximum Binance reconnection attempts reached");
         return false;
     }
     
     // Calculate delay
     int delay = calculateReconnectDelay();
-    
-    logger_.info("Reconnecting in {} ms (attempt {}/{})", delay, currentRetries_ + 1, maxRetries_);
+    logger_.info("Reconnecting to Binance in {} ms (attempt {}/{})", delay, currentRetries_ + 1, maxRetries_);
     
     // Sleep
     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
@@ -482,139 +487,19 @@ int WebSocketClient::calculateReconnectDelay() const {
     return delay;
 }
 
-std::optional<kubera::orderbook::OrderBookUpdate> WebSocketClient::parseMessage(const std::string& message) {
-    try {
-        logger_.debug("Parsing OKX message: {}", message.substr(0, 200) + "...");
-        
-        // Parse JSON using simdjson
-        simdjson::dom::parser parser;
-        simdjson::dom::element json = parser.parse(message);
-        
-        // Create update object
-        kubera::orderbook::OrderBookUpdate update;
-        
-        // Parse timestamp (required field)
-        if (json["timestamp"].error() == simdjson::SUCCESS) {
-            std::string_view timestampStr = json["timestamp"].get_string().value();
-            update.timestamp = std::string(timestampStr);
-        } else {
-            logger_.error("Missing required 'timestamp' field in OKX message");
-            return std::nullopt;
-        }
-        
-        // Parse exchange (required field)
-        if (json["exchange"].error() == simdjson::SUCCESS) {
-            std::string_view exchangeStr = json["exchange"].get_string().value();
-            update.exchange = std::string(exchangeStr);
-        } else {
-            logger_.error("Missing required 'exchange' field in OKX message");
-            return std::nullopt;
-        }
-        
-        // Parse symbol (required field)
-        if (json["symbol"].error() == simdjson::SUCCESS) {
-            std::string_view symbolStr = json["symbol"].get_string().value();
-            update.symbol = std::string(symbolStr);
-        } else {
-            logger_.error("Missing required 'symbol' field in OKX message");
-            return std::nullopt;
-        }
-        
-        // Parse asks array
-        if (json["asks"].error() == simdjson::SUCCESS) {
-            auto asksArray = json["asks"].get_array().value();
-            update.asks.reserve(asksArray.size()); // Pre-allocate for performance
-            
-            for (auto askElement : asksArray) {
-                try {
-                    auto askArray = askElement.get_array().value();
-                    if (askArray.size() >= 2) {
-                        // OKX sends price and quantity as strings
-                        std::string_view priceStr = askArray.at(0).get_string().value();
-                        std::string_view quantityStr = askArray.at(1).get_string().value();
-                        
-                        double price = std::stod(std::string(priceStr));
-                        double quantity = std::stod(std::string(quantityStr));
-                        
-                        update.asks.emplace_back(price, quantity);
-                    } else {
-                        logger_.warning("Invalid ask array format: expected 2 elements, got {}", askArray.size());
-                    }
-                } catch (const std::exception& e) {
-                    logger_.warning("Failed to parse ask entry: {}", e.what());
-                    continue; // Skip this entry but continue processing
-                }
-            }
-            logger_.debug("Parsed {} ask levels", update.asks.size());
-        } else {
-            logger_.warning("No 'asks' field found in OKX message");
-        }
-        
-        // Parse bids array
-        if (json["bids"].error() == simdjson::SUCCESS) {
-            auto bidsArray = json["bids"].get_array().value();
-            update.bids.reserve(bidsArray.size()); // Pre-allocate for performance
-            
-            for (auto bidElement : bidsArray) {
-                try {
-                    auto bidArray = bidElement.get_array().value();
-                    if (bidArray.size() >= 2) {
-                        // OKX sends price and quantity as strings
-                        std::string_view priceStr = bidArray.at(0).get_string().value();
-                        std::string_view quantityStr = bidArray.at(1).get_string().value();
-                        
-                        double price = std::stod(std::string(priceStr));
-                        double quantity = std::stod(std::string(quantityStr));
-                        
-                        update.bids.emplace_back(price, quantity);
-                    } else {
-                        logger_.warning("Invalid bid array format: expected 2 elements, got {}", bidArray.size());
-                    }
-                } catch (const std::exception& e) {
-                    logger_.warning("Failed to parse bid entry: {}", e.what());
-                    continue; // Skip this entry but continue processing
-                }
-            }
-            logger_.debug("Parsed {} bid levels", update.bids.size());
-        } else {
-            logger_.warning("No 'bids' field found in OKX message");
-        }
-        
-        // Validate that we have meaningful data
-        if (update.asks.empty() && update.bids.empty()) {
-            logger_.warning("Parsed OKX message contains no orderbook data");
-            return std::nullopt;
-        }
-        
-        logger_.debug("Successfully parsed OKX orderbook update: {} asks, {} bids for {}", 
-                    update.asks.size(), update.bids.size(), update.symbol);
-        
-        return update;
-        
-    } catch (const simdjson::simdjson_error& e) {
-        logger_.error("simdjson parsing error: {}", e.what());
-        return std::nullopt;
-    } catch (const std::exception& e) {
-        logger_.error("Failed to parse OKX message: {}", e.what());
-        logger_.debug("Message content: {}", message);
-        return std::nullopt;
-    }
+void WebSocketClient::setReconnectionOptions(
+    int maxRetries,
+    int initialDelayMs,
+    int maxDelayMs,
+    double backoffMultiplier
+) {
+    maxRetries_ = maxRetries;
+    initialDelayMs_ = initialDelayMs;
+    maxDelayMs_ = maxDelayMs;
+    backoffMultiplier_ = backoffMultiplier;
+    logger_.info("Binance reconnection options set: maxRetries={}, initialDelayMs={}, maxDelayMs={}, backoffMultiplier={}",
+                maxRetries_, initialDelayMs_, maxDelayMs_, backoffMultiplier_);
 }
-
-void WebSocketClient::setOrderBook(std::shared_ptr<kubera::orderbook::OrderBook> orderBook) {
-    orderBook_ = orderBook;
-    logger_.info("OrderBook linked to WebSocket client for direct HFT updates");
-}
-
-void WebSocketClient::processMessages() {
-    // This method is kept for API compatibility
-    // In optimized version, messages are processed asynchronously
-    // For now, just return - the read loop handles message processing
-    return;
-}
-
-
-
 
 } // namespace websocket
 } // namespace kubera
